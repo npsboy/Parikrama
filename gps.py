@@ -2,7 +2,7 @@ from machine import UART
 import time
 
 # GPS on GPIO32 (RX)
-gps = UART(1, baudrate=9600, rx=32)
+gps = UART(1, baudrate=9600, rx=18)
 
 def convert(coord):
     value = float(coord)
