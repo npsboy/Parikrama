@@ -13,6 +13,7 @@ uart = UART(2, baudrate=115200, tx=33, rx=25, timeout=1000)
 
 UPDATE_INTERVAL_S = 20   # stay above ThingSpeak's 15s free-tier limit
 NUM_SAMPLES = 5          # readings averaged per upload
+GPS_WINDOW_MS = 3000     # how long to listen for a fresh NMEA fix each cycle
 
 # ---------- AT / UART helpers ----------
 
@@ -148,6 +149,12 @@ turbidity = ADC(Pin(27))
 turbidity.atten(ADC.ATTN_11DB)   # 0-3.3V range (approximately)
 turbidity.width(ADC.WIDTH_12BIT) # 12-bit resolution (0-4095)
 
+# GPS on GPIO 18 (RX only — we never transmit to the module)
+gps_uart = UART(1, baudrate=9600, rx=18, timeout=1000)
+
+# Last known good fix, reused whenever we lose the fix temporarily.
+last_fix = None
+
 
 def average(values):
     valid = [v for v in values if v is not None]
@@ -185,6 +192,83 @@ def turbidity_percent(adc):
     return max(0.0, min(100.0, pct))
 
 
+def nmea_to_degrees(coord):
+    """NMEA ddmm.mmmm / dddmm.mmmm -> decimal degrees."""
+    value = float(coord)
+    degrees = int(value / 100)
+    minutes = value - (degrees * 100)
+    return degrees + (minutes / 60)
+
+
+def parse_rmc(text):
+    """Return (lat, lon) from a valid $GxRMC sentence, else None."""
+    if not (text.startswith('$GPRMC') or text.startswith('$GNRMC')):
+        return None
+
+    data = text.split(',')
+    if len(data) < 7:
+        return None
+
+    # data[2] == 'A' means the fix is valid ('V' = void)
+    if data[2] != 'A' or not data[3] or not data[5]:
+        return None
+
+    lat = nmea_to_degrees(data[3])
+    lon = nmea_to_degrees(data[5])
+
+    if data[4] == 'S':
+        lat = -lat
+    if data[6] == 'W':
+        lon = -lon
+
+    if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        return None
+
+    return lat, lon
+
+
+def read_gps():
+    """Listen for a fresh fix; fall back to the last one we saw.
+
+    The module streams NMEA continuously, so the RX buffer is full of stale
+    sentences by the time we get back here. Drop those first, then read for
+    up to GPS_WINDOW_MS looking for a valid RMC.
+    """
+    global last_fix
+
+    while gps_uart.any():
+        gps_uart.read(256)
+
+    deadline = time.ticks_add(time.ticks_ms(), GPS_WINDOW_MS)
+    while time.ticks_diff(deadline, time.ticks_ms()) > 0:
+        line = gps_uart.readline()
+        if not line:
+            continue
+        try:
+            text = line if isinstance(line, str) else line.decode()
+            fix = parse_rmc(text.strip())
+        except Exception as e:
+            print("  gps parse error:", e)
+            continue
+
+        if fix:
+            last_fix = fix
+            return fix
+
+    if last_fix:
+        print("  no GPS fix — reusing last known location")
+    else:
+        print("  no GPS fix yet")
+    return last_fix
+
+
+def format_location(fix):
+    """Human-readable form, for the console log only."""
+    if fix is None:
+        return None
+    return "{:.6f}, {:.6f}".format(fix[0], fix[1])
+
+
 def read_all():
     """Sample every sensor NUM_SAMPLES times and return the averaged values."""
     temps = []
@@ -212,10 +296,13 @@ def read_all():
 
 # ---------- ThingSpeak ----------
 
-def build_thingspeak_url(temp_c, ph_value, turb_pct):
+def build_thingspeak_url(temp_c, ph_value, turb_pct, fix):
     """field1=temperature, field2=predicted pH, field3=turbidity %.
 
-    Fields that are None are left out so ThingSpeak keeps the previous
+    The GPS fix goes into ThingSpeak's built-in lat/long parameters, which
+    are stored per entry as channel metadata and don't use up a field.
+
+    Values that are None are left out so ThingSpeak keeps the previous
     value rather than writing a bogus one.
     """
     url = "http://api.thingspeak.com/update?api_key={}".format(THINGSPEAK_API_KEY)
@@ -224,6 +311,8 @@ def build_thingspeak_url(temp_c, ph_value, turb_pct):
                          ("field3", turb_pct)):
         if value is not None:
             url += "&{}={:.2f}".format(field, value)
+    if fix is not None:
+        url += "&lat={:.6f}&long={:.6f}".format(fix[0], fix[1])
     return url
 
 
@@ -284,8 +373,9 @@ def main():
     while True:
         print("=== READ ===")
         temp_c, ph_value, turb_pct = read_all()
+        fix = read_gps()
 
-        url = build_thingspeak_url(temp_c, ph_value, turb_pct)
+        url = build_thingspeak_url(temp_c, ph_value, turb_pct, fix)
         status, body = http_get(url)
 
         print("=== UPLOAD ===")
@@ -294,6 +384,7 @@ def main():
         print("  field2 pH:        ", "n/a" if ph_value is None
               else "{:.2f}".format(ph_value))
         print("  field3 turbidity: ", "{:.2f} %".format(turb_pct))
+        print("  lat/long:         ", format_location(fix) or "n/a")
         print("Status:", status, "| Entry ID:", body)
         print()
 
