@@ -6,14 +6,19 @@ import ds18x20
 from machine import UART, ADC, Pin
 
 from secrets import THINGSPEAK_API_KEY
+import led
 
 gc.collect()
+
+led.all_off()
+led.start()
 
 uart = UART(2, baudrate=115200, tx=33, rx=25, timeout=1000)
 
 UPDATE_INTERVAL_S = 20   # stay above ThingSpeak's 15s free-tier limit
 NUM_SAMPLES = 5          # readings averaged per upload
 GPS_WINDOW_MS = 3000     # how long to listen for a fresh NMEA fix each cycle
+NO_FIX_TIMEOUT_MS = 30 * 60 * 1000  # how long without a fix before we blink green fast again
 
 # ---------- AT / UART helpers ----------
 
@@ -139,21 +144,27 @@ def http_get(url, timeout_ms=20000):
 ds = ds18x20.DS18X20(onewire.OneWire(Pin(4)))
 roms = ds.scan() or []
 print("Temperature devices found:", roms)
+if roms:
+    led.set_state(led.BLUE1, led.BLINK_FAST)
 
 # pH sensor on GPIO 34
 ph = ADC(Pin(34))
 ph.atten(ADC.ATTN_11DB)          # full 0-3.3V range
+led.set_state(led.BLUE2, led.BLINK_SLOW)
 
 # Turbidity sensor on GPIO 27
 turbidity = ADC(Pin(27))
 turbidity.atten(ADC.ATTN_11DB)   # 0-3.3V range (approximately)
 turbidity.width(ADC.WIDTH_12BIT) # 12-bit resolution (0-4095)
+led.set_state(led.BLUE1, led.BLINK_SLOW)
 
 # GPS on GPIO 18 (RX only — we never transmit to the module)
 gps_uart = UART(1, baudrate=9600, rx=18, timeout=1000)
+led.set_state(led.GREEN, led.BLINK_FAST)
 
 # Last known good fix, reused whenever we lose the fix temporarily.
 last_fix = None
+last_fix_time = 0
 
 
 def average(values):
@@ -234,7 +245,7 @@ def read_gps():
     sentences by the time we get back here. Drop those first, then read for
     up to GPS_WINDOW_MS looking for a valid RMC.
     """
-    global last_fix
+    global last_fix, last_fix_time
 
     while gps_uart.any():
         gps_uart.read(256)
@@ -253,12 +264,17 @@ def read_gps():
 
         if fix:
             last_fix = fix
+            last_fix_time = time.ticks_ms()
+            led.set_state(led.GREEN, led.BLINK_SLOW)
             return fix
 
     if last_fix:
         print("  no GPS fix — reusing last known location")
+        if time.ticks_diff(time.ticks_ms(), last_fix_time) > NO_FIX_TIMEOUT_MS:
+            led.set_state(led.GREEN, led.BLINK_FAST)
     else:
         print("  no GPS fix yet")
+        led.set_state(led.GREEN, led.BLINK_FAST)
     return last_fix
 
 
@@ -323,6 +339,7 @@ def network_init():
     if not wait_for_module():
         print("No response — check wiring/power")
         return False
+    led.set_state(led.RED, led.ON)
 
     time.sleep(2)
     flush_uart()
@@ -331,6 +348,7 @@ def network_init():
         print("SIM not ready")
         return False
     print("SIM ready")
+    led.set_state(led.RED, led.BLINK_FAST)
     flush_uart()
     send_at('AT+COPS=0', wait=10000)
 
@@ -339,6 +357,7 @@ def network_init():
         print("Not registered — stopping")
         return False
     print("Registered.\n")
+    led.set_state(led.RED, led.BLINK_SLOW)
 
     print("[A] Current context definitions")
     cgdcont = show("CGDCONT?", 'AT+CGDCONT?', wait=2000)
@@ -393,4 +412,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        led.all_off()
